@@ -174,15 +174,15 @@ use Work.Datatype.all;
 
 entity ALU is
     port (A, B: in bit_8;
-        op: in alu_operation;
+        Op: in alu_operation;
         C: out bit_8);
 end entity;
 
 architecture RTL of ALU is
 begin
-    process (A, B, op) is
+    process (A, B, Op) is
     begin
-        case (op) is
+        case (Op) is
             when pass => C <= A;
             when land => C <= (A and B);
             when lor => C <= (A or B);
@@ -201,15 +201,15 @@ use Work.Datatype.All;
 
 entity Shifter is
     port (D: in bit_8;
-        op: in shifter_operation;
+        Op: in shifter_operation;
         Q: out bit_8);
 end Shifter;
 
 architecture RTL of Shifter is
 begin
-    process (D, op) is
+    process (D, Op) is
     begin
-        case (op) is
+        case (Op) is
             when pass => Q <= D;
             when left => Q <= (D(6 downto 0) & '0');
             when right => Q <= ('0' & D(7 downto 1));
@@ -301,10 +301,32 @@ begin
     process (Clk, Reset, Dump, Load) is
         subtype memory_range is natural range 0 to ((2 ** address_width) - 1);
         type memory_array is array (memory_range) of std_logic_vector((data_width - 1) downto 0);
+        type file_binary is file of natural;
         variable memory_cell: memory_array;
         variable index: memory_range := 0;
         file target: text;
+        file target_binary: file_binary;
+        constant dump_binary: boolean := false;
+        constant load_binary: boolean := ((Path_Load'Length > 4) and (Path_Load(Path_Load'High - 2 to Path_Load'High) = "bin"));
         variable text_line: line;
+
+        impure function is_endfile return boolean is
+        begin
+            return (endfile(target) or endfile(target_binary));
+        end is_endfile;
+
+        procedure fopen_load is
+        begin
+            file_open(target, path_load, read_mode);
+            file_open(target_binary, path_load, read_mode);
+        end fopen_load;
+
+        procedure fclose is
+        begin
+            file_close(target);
+            file_close(target_binary);
+        end fclose;
+
         procedure dump_to_file is
         begin
             write(output, "DUMP MEMORY INTO FILE: " & path_dump & LF);
@@ -313,36 +335,43 @@ begin
                 write(text_line, to_integer(unsigned(memory_cell(i))));
                 writeline(target, text_line);
             end loop;
-            file_close(target);
+            fclose;
         end dump_to_file;
+
         procedure load_from_file is
+            variable read_word: natural;
             variable duplicate: line;
             variable need_free: boolean;
         begin
             write(output, "LOAD MEMORY FROM FILE: " & path_load & LF);
-            file_open(target, path_load, read_mode);
+            fopen_load;
             for i in memory_cell'range loop
-                exit when endfile(target);
-                duplicate := null;
-                need_free := false;
-                readline(target, text_line);
-                for j in text_line.all'range loop
-                    if ((text_line.all(j) = ' ') and (j /= text_line.all'low)) then
-                        duplicate := new string(text_line.all'low to j);
-                        duplicate.all := text_line.all(text_line.all'low to j);
-                        need_free := true;
-                        exit;
+                exit when is_endfile;
+                if (not load_binary) then
+                    duplicate := null;
+                    need_free := false;
+                    readline(target, text_line);
+                    for j in text_line.all'range loop
+                        if ((text_line.all(j) = ' ') and (j /= text_line.all'low)) then
+                            duplicate := new string(text_line.all'low to j);
+                            duplicate.all := text_line.all(text_line.all'low to j);
+                            need_free := true;
+                            exit;
+                        end if;
+                    end loop;
+                    if (duplicate = null) then
+                        duplicate := text_line;
                     end if;
-                end loop;
-                if (duplicate = null) then
-                    duplicate := text_line;
-                end if;
-                memory_cell(i) := std_logic_vector(to_unsigned(integer'value(duplicate.all), data_width));
-                if (need_free) then
-                    deallocate(duplicate);
+                    memory_cell(i) := std_logic_vector(to_unsigned(natural'value(duplicate.all), data_width));
+                    if (need_free) then
+                        deallocate(duplicate);
+                    end if;
+                else
+                    read(target_binary, read_word);
+                    memory_cell(i) := std_logic_vector(to_unsigned(read_word, data_width));
                 end if;
             end loop;
-            file_close(target);
+            fclose;
         end load_from_file;
     begin
         text_line := null;
@@ -501,32 +530,28 @@ begin
     ram_ce <= '0' when (ram_ce_shared = 'L') else '1'; -- PULL DOWN
     F0: entity Work.Fifo generic map (16, 8) port map (phi2, queue_push_in, queue_push_out, queue_push,
         queue_pop, queue_empty, queue_full, queue_length, queue_flush);
-    process is
+
+    Prefetch_Queue: process is
         variable byte_read: bus_bit_8;
         variable absolute: bit_8;
         variable displacement: natural := 0;
-        variable first: boolean;
+        variable skip: std_logic := '0';
     begin
         if ((rst_cpu = '1') or (queue_flush = '1')) then
+            displacement := to_integer(unsigned(PC));
             PC_fetch <= x"00";
-            if (rst_cpu = '1') then
-                first := true;
-            end if;
+            skip := '1';
         elsif (rising_edge(phi1) and (queue_full = '0') and prefetch) then
-            if (queue_flush = '1') then
-                displacement := to_integer(unsigned(PC));
-            elsif (not first) then
-                displacement := (displacement + 1);
-                if (displacement > 16#FF#) then
-                    displacement := 0;
-                end if;
-            end if;
             absolute := bit_8(to_unsigned(displacement, 8));
             PC_fetch <= absolute;
-            queue_push <= to_std_logic(bool_to_bit((queue_flush = '0') and (not first)));
+            displacement := (displacement + 1);
+            if (displacement > 16#FF#) then
+                displacement := 0;
+            end if;
+            queue_push <= (not skip);
             read_ram(address_shared, data, absolute, byte_read, ram_ce_shared, ram_we, ready, false);
             queue_push_in <= byte_read;
-            first := false;
+            skip := '0';
         end if;
         address_shared <= HighZ;
         ram_ce_shared <= 'L';
@@ -534,7 +559,8 @@ begin
         queue_push <= '0';
         wait on phi1;
     end process;
-    process is
+
+    Decode_Unit: process is
         variable INST1, INST2: bit_8;
         alias OPCODE: bit_4 is INST1(7 downto 4);
         alias OP1: bit_4 is INST1(3 downto 0);
@@ -798,7 +824,7 @@ begin
     --wake_up <= '0';
     CPU0: entity Work.CPU port map (reset, clk, clki, ready, address, data, ram_ce, ram_we, ram_ro, wake_up);
     RAM0: entity Work.Memory generic map (8, 8) port map (clki, data, address,
-        ram_ce, ram_we, ram_ro, reset, ready, "RAM.txt", dump, "CODE.txt", load);
+        ram_ce, ram_we, ram_ro, reset, ready, "RAM.txt", dump, "CODE.bin", load);
     CLK0: entity Work.Clock generic map (6 fs) port map (clk, clki, clk2);
     process is
         variable result: bus_bit_8;
